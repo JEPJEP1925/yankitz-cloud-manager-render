@@ -310,7 +310,7 @@ async function sendDiscordNotification(title, description, fields = []) {
 
         if (!webhookUrl || (!webhookUrl.startsWith('http://') && !webhookUrl.startsWith('https://'))) {
             console.warn('[Discord] Skipped: no webhook URL configured.');
-            return;
+            return { ok: false, reason: 'no_webhook_configured' };
         }
 
         const payload = JSON.stringify({
@@ -338,36 +338,39 @@ async function sendDiscordNotification(title, description, fields = []) {
         // Wrapped in a Promise and awaited by every caller so the request is
         // guaranteed to finish (or fail loudly) before the handler returns,
         // instead of being fire-and-forget and silently dropped mid-flight.
-        await new Promise((resolve) => {
+        const result = await new Promise((resolve) => {
             const req = client.request(reqOptions, (discordRes) => {
                 let body = '';
                 discordRes.on('data', (chunk) => { body += chunk; });
                 discordRes.on('end', () => {
                     if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
                         console.log(`[Discord] Sent "${title}" (status ${discordRes.statusCode}).`);
+                        resolve({ ok: true, status: discordRes.statusCode });
                     } else {
                         console.error(`[Discord] Webhook rejected "${title}": status ${discordRes.statusCode} body=${body.slice(0, 300)}`);
+                        resolve({ ok: false, reason: 'rejected', status: discordRes.statusCode, body: body.slice(0, 300) });
                     }
-                    resolve();
                 });
             });
 
             req.on('timeout', () => {
                 console.error(`[Discord] Timed out sending "${title}".`);
                 req.destroy();
-                resolve();
+                resolve({ ok: false, reason: 'timeout' });
             });
 
             req.on('error', (err) => {
                 console.error(`[Discord] Request error sending "${title}":`, err.message);
-                resolve();
+                resolve({ ok: false, reason: 'request_error', message: err.message });
             });
 
             req.write(payload);
             req.end();
         });
+        return result;
     } catch (e) {
         console.error('[Discord] sendDiscordNotification failed:', e.message);
+        return { ok: false, reason: 'exception', message: e.message };
     }
 }
 
@@ -2261,6 +2264,22 @@ app.post('/api/logs/clear', async (req, res) => {
     const placeholders = ids.map(() => '?').join(',');
     await db.execute({ sql: `DELETE FROM activity_logs WHERE id IN (${placeholders})`, args: ids });
     res.json({ success: true });
+});
+
+// --- TEMPORARY DIAGNOSTIC: test the Discord webhook directly and see the real result. ---
+// Visit in browser: /api/debug/discord-test?admin_auth_password=YOUR_ADMIN_PASSWORD
+// Remove this route once the Discord notification issue is confirmed resolved.
+app.get('/api/debug/discord-test', async (req, res) => {
+    const isValidAdmin = await verifyAdminPassword(req.query.admin_auth_password);
+    if (!isValidAdmin) return res.status(401).json({ error: 'Invalid Admin Password' });
+
+    const result = await sendDiscordNotification(
+        "Diagnostic Test",
+        "This is a manual test triggered from /api/debug/discord-test.",
+        [{ name: "Triggered At", value: new Date().toISOString(), inline: false }]
+    );
+
+    res.json({ discordResult: result });
 });
 
 app.get('/api/settings', async (req, res) => {
