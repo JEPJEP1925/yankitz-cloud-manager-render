@@ -2334,6 +2334,83 @@ app.post('/api/logs/clear', async (req, res) => {
     res.json({ success: true });
 });
 
+// --- DISCORD RELAY ENDPOINT ---
+// Same codebase runs on Render, Railway, and Vercel. If Render's outbound IP
+// gets Cloudflare-edge-blocked when calling Discord directly, Render can instead
+// POST here on the Railway (or Vercel) deployment, which forwards to Discord from
+// its own (working) network path. Protected by a shared secret so it can't be
+// used as an open relay by anyone else, and the target URL is restricted to real
+// Discord webhook URLs to prevent SSRF, same pattern as isAllowedGoogleUploadUrl.
+function isAllowedDiscordWebhookUrl(candidate) {
+    let urlObj;
+    try {
+        urlObj = new URL(candidate);
+    } catch (e) {
+        return null;
+    }
+    if (urlObj.protocol !== 'https:') return null;
+    const host = urlObj.hostname.toLowerCase();
+    if (host !== 'discord.com' && host !== 'discordapp.com') return null;
+    if (!urlObj.pathname.startsWith('/api/webhooks/')) return null;
+    return urlObj;
+}
+
+app.post('/api/relay/discord', (req, res) => {
+    const secret = req.headers['x-relay-secret'];
+    const expectedSecret = process.env.DISCORD_RELAY_SECRET;
+
+    if (!expectedSecret || !secret || secret !== expectedSecret) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const { webhookUrl, payload } = req.body || {};
+    if (!webhookUrl || typeof webhookUrl !== 'string') {
+        return res.status(400).json({ error: 'Missing webhookUrl' });
+    }
+    if (!payload || typeof payload !== 'object') {
+        return res.status(400).json({ error: 'Missing payload' });
+    }
+
+    const urlObj = isAllowedDiscordWebhookUrl(webhookUrl);
+    if (!urlObj) {
+        return res.status(400).json({ error: 'Invalid or disallowed webhook URL' });
+    }
+
+    const body = JSON.stringify(payload);
+    const reqOptions = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body)
+        },
+        timeout: 10000
+    };
+
+    const discordReq = https.request(reqOptions, (discordRes) => {
+        let resBody = '';
+        discordRes.on('data', (chunk) => { resBody += chunk; });
+        discordRes.on('end', () => {
+            console.log(`[Discord Relay] Forwarded notification: status ${discordRes.statusCode}`);
+            res.status(discordRes.statusCode).send(resBody || '{}');
+        });
+    });
+
+    discordReq.on('timeout', () => {
+        discordReq.destroy();
+        res.status(504).json({ error: 'Relay timeout reaching Discord' });
+    });
+
+    discordReq.on('error', (err) => {
+        console.error('[Discord Relay] Error forwarding to Discord:', err.message);
+        if (!res.headersSent) res.status(502).json({ error: err.message });
+    });
+
+    discordReq.write(body);
+    discordReq.end();
+});
+
 // --- TEMPORARY DIAGNOSTIC: test the Discord webhook directly and see the real result. ---
 // Visit in browser: /api/debug/discord-test?admin_auth_password=YOUR_ADMIN_PASSWORD
 // Remove this route once the Discord notification issue is confirmed resolved.
