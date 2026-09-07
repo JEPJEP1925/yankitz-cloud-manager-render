@@ -299,81 +299,18 @@ async function verifyAnyPassword(providedPwd) {
     return isAdmin;
 }
 
-// If DISCORD_RELAY_URL is set, notifications are POSTed to that relay (e.g. a
-// Cloudflare Worker endpoint) instead of straight to discord.com. This exists
-// because Render's shared outbound IPs can get Cloudflare-edge-blocked
-// (HTTP 429 / "error code: 1015") before the request ever reaches Discord.
-// The relay runs on infrastructure with a working egress path to Discord and
-// simply forwards the payload on. DISCORD_RELAY_SECRET authenticates the
-// request so the relay isn't an open proxy. If DISCORD_RELAY_URL isn't set,
-// behavior falls back to the original direct-to-Discord call.
-async function sendViaRelay(relayUrl, webhookUrl, payload, title) {
-    return new Promise((resolve) => {
-        let urlObj;
-        try {
-            urlObj = new URL(relayUrl);
-        } catch (e) {
-            console.error(`[Discord] Invalid DISCORD_RELAY_URL: ${e.message}`);
-            resolve({ ok: false, reason: 'invalid_relay_url' });
-            return;
-        }
-
-        const body = JSON.stringify({ webhookUrl, payload: JSON.parse(payload) });
-        const reqOptions = {
-            hostname: urlObj.hostname,
-            path: urlObj.pathname + urlObj.search,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(body),
-                'x-relay-secret': process.env.DISCORD_RELAY_SECRET || ''
-            },
-            timeout: 10000
-        };
-
-        const client = urlObj.protocol === 'https:' ? https : http;
-        const req = client.request(reqOptions, (relayRes) => {
-            let resBody = '';
-            relayRes.on('data', (chunk) => { resBody += chunk; });
-            relayRes.on('end', () => {
-                if (relayRes.statusCode >= 200 && relayRes.statusCode < 300) {
-                    console.log(`[Discord] Relayed "${title}" via ${urlObj.hostname} (status ${relayRes.statusCode}).`);
-                    resolve({ ok: true, status: relayRes.statusCode, via: 'relay' });
-                } else {
-                    console.error(`[Discord] Relay rejected "${title}": status ${relayRes.statusCode} body=${resBody.slice(0, 300)}`);
-                    resolve({ ok: false, reason: 'relay_rejected', status: relayRes.statusCode, body: resBody.slice(0, 300) });
-                }
-            });
-        });
-
-        req.on('timeout', () => {
-            console.error(`[Discord] Relay timed out sending "${title}".`);
-            req.destroy();
-            resolve({ ok: false, reason: 'relay_timeout' });
-        });
-
-        req.on('error', (err) => {
-            console.error(`[Discord] Relay request error sending "${title}":`, err.message);
-            resolve({ ok: false, reason: 'relay_request_error', message: err.message });
-        });
-
-        req.write(body);
-        req.end();
-    });
-}
-
 async function sendDiscordNotification(title, description, fields = []) {
     try {
         const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
         const row = res.rows[0];
-
-        let webhookUrl = (row && row.value && row.value.trim() !== '')
-            ? row.value.trim()
+        
+        let webhookUrl = (row && row.value && row.value.trim() !== '') 
+            ? row.value.trim() 
             : (process.env.DISCORD_WEBHOOK || '');
 
         if (!webhookUrl || (!webhookUrl.startsWith('http://') && !webhookUrl.startsWith('https://'))) {
-            console.warn('[Discord] Skipped: no webhook URL configured.');
-            return { ok: false, reason: 'no_webhook_configured' };
+            console.warn("Discord Webhook notification skipped: No valid Webhook URL configured.");
+            return;
         }
 
         const payload = JSON.stringify({
@@ -384,11 +321,6 @@ async function sendDiscordNotification(title, description, fields = []) {
             }]
         });
 
-        const relayUrl = process.env.DISCORD_RELAY_URL;
-        if (relayUrl && relayUrl.trim() !== '') {
-            return await sendViaRelay(relayUrl.trim(), webhookUrl, payload, title);
-        }
-
         const urlObj = new URL(webhookUrl);
         const reqOptions = {
             hostname: urlObj.hostname,
@@ -397,48 +329,26 @@ async function sendDiscordNotification(title, description, fields = []) {
             headers: {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(payload)
-            },
-            timeout: 10000
+            }
         };
 
         const client = urlObj.protocol === 'https:' ? https : http;
-
-        // Wrapped in a Promise and awaited by every caller so the request is
-        // guaranteed to finish (or fail loudly) before the handler returns,
-        // instead of being fire-and-forget and silently dropped mid-flight.
-        const result = await new Promise((resolve) => {
-            const req = client.request(reqOptions, (discordRes) => {
-                let body = '';
-                discordRes.on('data', (chunk) => { body += chunk; });
-                discordRes.on('end', () => {
-                    if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
-                        console.log(`[Discord] Sent "${title}" (status ${discordRes.statusCode}).`);
-                        resolve({ ok: true, status: discordRes.statusCode });
-                    } else {
-                        console.error(`[Discord] Webhook rejected "${title}": status ${discordRes.statusCode} body=${body.slice(0, 300)}`);
-                        resolve({ ok: false, reason: 'rejected', status: discordRes.statusCode, body: body.slice(0, 300) });
-                    }
-                });
-            });
-
-            req.on('timeout', () => {
-                console.error(`[Discord] Timed out sending "${title}".`);
-                req.destroy();
-                resolve({ ok: false, reason: 'timeout' });
-            });
-
-            req.on('error', (err) => {
-                console.error(`[Discord] Request error sending "${title}":`, err.message);
-                resolve({ ok: false, reason: 'request_error', message: err.message });
-            });
-
-            req.write(payload);
-            req.end();
+        const req = client.request(reqOptions, (discordRes) => {
+            if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
+                console.log("Discord notification delivered successfully.");
+            } else {
+                console.error(`Discord Webhook failed with status code: ${discordRes.statusCode}`);
+            }
         });
-        return result;
+
+        req.on('error', (err) => {
+            console.error("Discord Webhook network error:", err.message);
+        });
+
+        req.write(payload);
+        req.end();
     } catch (e) {
-        console.error('[Discord] sendDiscordNotification failed:', e.message);
-        return { ok: false, reason: 'exception', message: e.message };
+        console.error("Error executing sendDiscordNotification:", e.message);
     }
 }
 
@@ -1264,12 +1174,11 @@ function isAllowedGoogleUploadUrl(candidate) {
     try {
         urlObj = new URL(candidate);
     } catch (e) {
-        return null; // malformed URL
+        return null;
     }
 
     if (urlObj.protocol !== 'https:') return null;
     if (!ALLOWED_UPLOAD_HOSTNAMES.has(urlObj.hostname.toLowerCase())) return null;
-    // Google Drive resumable upload URLs live under this path prefix.
     if (!urlObj.pathname.startsWith('/upload/drive/')) return null;
 
     return urlObj;
@@ -1377,7 +1286,7 @@ app.post('/api/forward-incoming/:id', async (req, res) => {
 
         await logActivity('FORWARDED_INCOMING_FILE', { incomingId, slug: customSlug, fileName: row.original_name, ip: clientIp });
 
-        await sendDiscordNotification("Incoming File Forwarded as Shared Link", `An incoming file was forwarded and protected.`, [
+        sendDiscordNotification("Incoming File Forwarded as Shared Link", `An incoming file was forwarded and protected.`, [
             { name: "File Name", value: row.original_name, inline: true },
             { name: "Share Slug", value: customSlug, inline: true },
             { name: "Protected", value: password ? "Yes 🔒" : "No 🔓", inline: true },
@@ -1437,7 +1346,7 @@ app.post('/api/pre-reserve-link', async (req, res) => {
 
         await logActivity('PRE_RESERVED_LINK', { slug: customSlug, fileName, ip: clientIp });
 
-        await sendDiscordNotification("Pre-Reserved Link Created", `A link was pre-reserved for manual Google Drive upload.`, [
+        sendDiscordNotification("Pre-Reserved Link Created", `A link was pre-reserved for manual Google Drive upload.`, [
             { name: "File Name", value: fileName, inline: true },
             { name: "Share ID / Slug", value: customSlug, inline: true },
             { name: "URL", value: shareUrl, inline: false }
@@ -1517,7 +1426,7 @@ app.post('/api/finalize-drive-upload', async (req, res) => {
 
         await logActivity('FILE_UPLOAD', { slug: customSlug, fileName, size: totalSize, ip: clientIp });
 
-        await sendDiscordNotification("New Shared File Created", `A file was shared via Yankitz Cloud Manager.`, [
+        sendDiscordNotification("New Shared File Created", `A file was shared via Yankitz Cloud Manager.`, [
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(totalSize), inline: true },
             { name: "Share ID / Slug", value: customSlug, inline: true },
@@ -1588,7 +1497,7 @@ app.post('/api/finalize-incoming-upload/:slug', async (req, res) => {
 
         await logActivity('INCOMING_FILE_UPLOAD', { requestTitle: requestRow.title, fileName, size: totalSize, ip: clientIp });
 
-        await sendDiscordNotification("Incoming Requested File Uploaded", `A user uploaded a file for a request.`, [
+        sendDiscordNotification("Incoming Requested File Uploaded", `A user uploaded a file for a request.`, [
             { name: "Request Title", value: requestRow.title, inline: true },
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(totalSize), inline: true }
@@ -1618,7 +1527,7 @@ app.post('/api/pre-reserve-incoming-link/:slug', async (req, res) => {
 
         await logActivity('PRE_RESERVED_INCOMING', { requestTitle: requestRow.title, fileName, ip: clientIp });
 
-        await sendDiscordNotification("Pre-Reserved Incoming File Created", `A user pre-reserved a file entry for a request portal.`, [
+        sendDiscordNotification("Pre-Reserved Incoming File Created", `A user pre-reserved a file entry for a request portal.`, [
             { name: "Request Title", value: requestRow.title, inline: true },
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(fileSize), inline: true }
@@ -2006,7 +1915,7 @@ app.post('/api/requests', async (req, res) => {
 
     await logActivity('REQUEST_CREATED', { slug, title, email, ip: clientIp });
 
-    await sendDiscordNotification("New Upload Request Link Generated", `A file upload request link has been created.`, [
+    sendDiscordNotification("New Upload Request Link Generated", `A file upload request link has been created.`, [
         { name: "Request Title", value: title, inline: true },
         { name: "Share ID / Slug", value: slug, inline: true },
         { name: "Recipient Email", value: email || "N/A", inline: true },
@@ -2334,99 +2243,6 @@ app.post('/api/logs/clear', async (req, res) => {
     res.json({ success: true });
 });
 
-// --- DISCORD RELAY ENDPOINT ---
-// Same codebase runs on Render, Railway, and Vercel. If Render's outbound IP
-// gets Cloudflare-edge-blocked when calling Discord directly, Render can instead
-// POST here on the Railway (or Vercel) deployment, which forwards to Discord from
-// its own (working) network path. Protected by a shared secret so it can't be
-// used as an open relay by anyone else, and the target URL is restricted to real
-// Discord webhook URLs to prevent SSRF, same pattern as isAllowedGoogleUploadUrl.
-function isAllowedDiscordWebhookUrl(candidate) {
-    let urlObj;
-    try {
-        urlObj = new URL(candidate);
-    } catch (e) {
-        return null;
-    }
-    if (urlObj.protocol !== 'https:') return null;
-    const host = urlObj.hostname.toLowerCase();
-    if (host !== 'discord.com' && host !== 'discordapp.com') return null;
-    if (!urlObj.pathname.startsWith('/api/webhooks/')) return null;
-    return urlObj;
-}
-
-app.post('/api/relay/discord', (req, res) => {
-    const secret = req.headers['x-relay-secret'];
-    const expectedSecret = process.env.DISCORD_RELAY_SECRET;
-
-    if (!expectedSecret || !secret || secret !== expectedSecret) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const { webhookUrl, payload } = req.body || {};
-    if (!webhookUrl || typeof webhookUrl !== 'string') {
-        return res.status(400).json({ error: 'Missing webhookUrl' });
-    }
-    if (!payload || typeof payload !== 'object') {
-        return res.status(400).json({ error: 'Missing payload' });
-    }
-
-    const urlObj = isAllowedDiscordWebhookUrl(webhookUrl);
-    if (!urlObj) {
-        return res.status(400).json({ error: 'Invalid or disallowed webhook URL' });
-    }
-
-    const body = JSON.stringify(payload);
-    const reqOptions = {
-        hostname: urlObj.hostname,
-        path: urlObj.pathname + urlObj.search,
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(body)
-        },
-        timeout: 10000
-    };
-
-    const discordReq = https.request(reqOptions, (discordRes) => {
-        let resBody = '';
-        discordRes.on('data', (chunk) => { resBody += chunk; });
-        discordRes.on('end', () => {
-            console.log(`[Discord Relay] Forwarded notification: status ${discordRes.statusCode}`);
-            res.status(discordRes.statusCode).send(resBody || '{}');
-        });
-    });
-
-    discordReq.on('timeout', () => {
-        discordReq.destroy();
-        res.status(504).json({ error: 'Relay timeout reaching Discord' });
-    });
-
-    discordReq.on('error', (err) => {
-        console.error('[Discord Relay] Error forwarding to Discord:', err.message);
-        if (!res.headersSent) res.status(502).json({ error: err.message });
-    });
-
-    discordReq.write(body);
-    discordReq.end();
-});
-
-// --- TEMPORARY DIAGNOSTIC: test the Discord webhook directly and see the real result. ---
-// Visit in browser: /api/debug/discord-test?admin_auth_password=YOUR_ADMIN_PASSWORD
-// Remove this route once the Discord notification issue is confirmed resolved.
-app.get('/api/debug/discord-test', async (req, res) => {
-    const isValidAdmin = await verifyAdminPassword(req.query.admin_auth_password);
-    if (!isValidAdmin) return res.status(401).json({ error: 'Invalid Admin Password' });
-
-    const result = await sendDiscordNotification(
-        "Diagnostic Test",
-        "This is a manual test triggered from /api/debug/discord-test.",
-        [{ name: "Triggered At", value: new Date().toISOString(), inline: false }]
-    );
-
-    res.json({ discordResult: result });
-});
-
 app.get('/api/settings', async (req, res) => {
     try {
         const result = await db.execute(`SELECT * FROM settings`);
@@ -2437,8 +2253,6 @@ app.get('/api/settings', async (req, res) => {
         const hasAdminPassword = !!((rawSettings.admin_password !== undefined && rawSettings.admin_password !== null && rawSettings.admin_password.trim() !== '') || process.env.ADMIN_PASSWORD);
         const hasUserPassword = !!((rawSettings.user_password !== undefined && rawSettings.user_password !== null && rawSettings.user_password.trim() !== '') || process.env.USER_PASSWORD);
 
-        // Never return the actual secret values (webhook URL, passwords) to the client.
-        // Only expose whether each is currently configured.
         res.json({
             settings: {
                 discord_webhook_set: hasDiscordWebhook,

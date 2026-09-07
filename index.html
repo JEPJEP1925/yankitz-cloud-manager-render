@@ -112,7 +112,6 @@
             user-select: none;
         }
 
-        /* Reduced Compact Notification Banner */
         .app-notification-card {
             background: #ffffff;
             border-radius: 12px;
@@ -145,7 +144,6 @@
             min-width: 60px;
         }
 
-        /* Reduced Compact Confirmation Dialog */
         .confirm-dialog-card {
             background: #ffffff;
             border-radius: 14px;
@@ -1913,7 +1911,7 @@
     }
 
     async function saveSettings() {
-        const webhook = document.getElementById('discordWebhook').value;
+        const webhook = document.getElementById('discordWebhook').value.trim();
         const userPwd = document.getElementById('userPassword').value;
         const adminPwd = document.getElementById('adminPassword').value;
         const clearUserPwd = document.getElementById('clearUserPassword').checked;
@@ -1927,16 +1925,21 @@
             valid = await verifyAdminPasswordCheck(adminAuthPrompt);
         }
 
+        const payload = {
+            user_password: userPwd,
+            admin_password: adminPwd,
+            clear_user_password: clearUserPwd,
+            admin_auth_password: adminAuthPrompt
+        };
+
+        if (webhook !== '') {
+            payload.discord_webhook = webhook;
+        }
+
         const settingsRes = await fetch('/api/settings', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ 
-                discord_webhook: webhook,
-                user_password: userPwd,
-                admin_password: adminPwd,
-                clear_user_password: clearUserPwd,
-                admin_auth_password: adminAuthPrompt
-            })
+            body: JSON.stringify(payload)
         });
 
         if (settingsRes.ok) {
