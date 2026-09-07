@@ -1,0 +1,17 @@
+{
+  "name": "yankitz-cloud-manager",
+  "version": "1.0.0",
+  "description": "Yankitz Cloud Manager with Turso Cloud Storage",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.14.0",
+    "sqlite3": "^5.1.7",
+    "adm-zip": "^0.5.10",
+    "express": "^4.18.2",
+    "googleapis": "^126.0.0",
+    "multer": "^1.4.5-lts.1"
+  }
+}
