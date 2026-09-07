@@ -303,12 +303,15 @@ async function sendDiscordNotification(title, description, fields = []) {
     try {
         const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
         const row = res.rows[0];
-        
-        let webhookUrl = (row && row.value && row.value.trim() !== '') 
-            ? row.value.trim() 
+
+        let webhookUrl = (row && row.value && row.value.trim() !== '')
+            ? row.value.trim()
             : (process.env.DISCORD_WEBHOOK || '');
 
-        if (!webhookUrl || (!webhookUrl.startsWith('http://') && !webhookUrl.startsWith('https://'))) return;
+        if (!webhookUrl || (!webhookUrl.startsWith('http://') && !webhookUrl.startsWith('https://'))) {
+            console.warn('[Discord] Skipped: no webhook URL configured.');
+            return;
+        }
 
         const payload = JSON.stringify({
             embeds: [{
@@ -326,14 +329,46 @@ async function sendDiscordNotification(title, description, fields = []) {
             headers: {
                 'Content-Type': 'application/json',
                 'Content-Length': Buffer.byteLength(payload)
-            }
+            },
+            timeout: 10000
         };
 
         const client = urlObj.protocol === 'https:' ? https : http;
-        const req = client.request(reqOptions);
-        req.write(payload);
-        req.end();
-    } catch (e) {}
+
+        // Wrapped in a Promise and awaited by every caller so the request is
+        // guaranteed to finish (or fail loudly) before the handler returns,
+        // instead of being fire-and-forget and silently dropped mid-flight.
+        await new Promise((resolve) => {
+            const req = client.request(reqOptions, (discordRes) => {
+                let body = '';
+                discordRes.on('data', (chunk) => { body += chunk; });
+                discordRes.on('end', () => {
+                    if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
+                        console.log(`[Discord] Sent "${title}" (status ${discordRes.statusCode}).`);
+                    } else {
+                        console.error(`[Discord] Webhook rejected "${title}": status ${discordRes.statusCode} body=${body.slice(0, 300)}`);
+                    }
+                    resolve();
+                });
+            });
+
+            req.on('timeout', () => {
+                console.error(`[Discord] Timed out sending "${title}".`);
+                req.destroy();
+                resolve();
+            });
+
+            req.on('error', (err) => {
+                console.error(`[Discord] Request error sending "${title}":`, err.message);
+                resolve();
+            });
+
+            req.write(payload);
+            req.end();
+        });
+    } catch (e) {
+        console.error('[Discord] sendDiscordNotification failed:', e.message);
+    }
 }
 
 function parseRangeHeader(rangeHeader, fileSize) {
@@ -1271,7 +1306,7 @@ app.post('/api/forward-incoming/:id', async (req, res) => {
 
         await logActivity('FORWARDED_INCOMING_FILE', { incomingId, slug: customSlug, fileName: row.original_name, ip: clientIp });
 
-        sendDiscordNotification("Incoming File Forwarded as Shared Link", `An incoming file was forwarded and protected.`, [
+        await sendDiscordNotification("Incoming File Forwarded as Shared Link", `An incoming file was forwarded and protected.`, [
             { name: "File Name", value: row.original_name, inline: true },
             { name: "Share Slug", value: customSlug, inline: true },
             { name: "Protected", value: password ? "Yes 🔒" : "No 🔓", inline: true },
@@ -1331,7 +1366,7 @@ app.post('/api/pre-reserve-link', async (req, res) => {
 
         await logActivity('PRE_RESERVED_LINK', { slug: customSlug, fileName, ip: clientIp });
 
-        sendDiscordNotification("Pre-Reserved Link Created", `A link was pre-reserved for manual Google Drive upload.`, [
+        await sendDiscordNotification("Pre-Reserved Link Created", `A link was pre-reserved for manual Google Drive upload.`, [
             { name: "File Name", value: fileName, inline: true },
             { name: "Share ID / Slug", value: customSlug, inline: true },
             { name: "URL", value: shareUrl, inline: false }
@@ -1411,7 +1446,7 @@ app.post('/api/finalize-drive-upload', async (req, res) => {
 
         await logActivity('FILE_UPLOAD', { slug: customSlug, fileName, size: totalSize, ip: clientIp });
 
-        sendDiscordNotification("New Shared File Created", `A file was shared via Yankitz Cloud Manager.`, [
+        await sendDiscordNotification("New Shared File Created", `A file was shared via Yankitz Cloud Manager.`, [
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(totalSize), inline: true },
             { name: "Share ID / Slug", value: customSlug, inline: true },
@@ -1482,7 +1517,7 @@ app.post('/api/finalize-incoming-upload/:slug', async (req, res) => {
 
         await logActivity('INCOMING_FILE_UPLOAD', { requestTitle: requestRow.title, fileName, size: totalSize, ip: clientIp });
 
-        sendDiscordNotification("Incoming Requested File Uploaded", `A user uploaded a file for a request.`, [
+        await sendDiscordNotification("Incoming Requested File Uploaded", `A user uploaded a file for a request.`, [
             { name: "Request Title", value: requestRow.title, inline: true },
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(totalSize), inline: true }
@@ -1512,7 +1547,7 @@ app.post('/api/pre-reserve-incoming-link/:slug', async (req, res) => {
 
         await logActivity('PRE_RESERVED_INCOMING', { requestTitle: requestRow.title, fileName, ip: clientIp });
 
-        sendDiscordNotification("Pre-Reserved Incoming File Created", `A user pre-reserved a file entry for a request portal.`, [
+        await sendDiscordNotification("Pre-Reserved Incoming File Created", `A user pre-reserved a file entry for a request portal.`, [
             { name: "Request Title", value: requestRow.title, inline: true },
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(fileSize), inline: true }
@@ -1900,7 +1935,7 @@ app.post('/api/requests', async (req, res) => {
 
     await logActivity('REQUEST_CREATED', { slug, title, email, ip: clientIp });
 
-    sendDiscordNotification("New Upload Request Link Generated", `A file upload request link has been created.`, [
+    await sendDiscordNotification("New Upload Request Link Generated", `A file upload request link has been created.`, [
         { name: "Request Title", value: title, inline: true },
         { name: "Share ID / Slug", value: slug, inline: true },
         { name: "Recipient Email", value: email || "N/A", inline: true },
