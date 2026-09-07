@@ -299,6 +299,69 @@ async function verifyAnyPassword(providedPwd) {
     return isAdmin;
 }
 
+// If DISCORD_RELAY_URL is set, notifications are POSTed to that relay (e.g. a
+// Cloudflare Worker endpoint) instead of straight to discord.com. This exists
+// because Render's shared outbound IPs can get Cloudflare-edge-blocked
+// (HTTP 429 / "error code: 1015") before the request ever reaches Discord.
+// The relay runs on infrastructure with a working egress path to Discord and
+// simply forwards the payload on. DISCORD_RELAY_SECRET authenticates the
+// request so the relay isn't an open proxy. If DISCORD_RELAY_URL isn't set,
+// behavior falls back to the original direct-to-Discord call.
+async function sendViaRelay(relayUrl, webhookUrl, payload, title) {
+    return new Promise((resolve) => {
+        let urlObj;
+        try {
+            urlObj = new URL(relayUrl);
+        } catch (e) {
+            console.error(`[Discord] Invalid DISCORD_RELAY_URL: ${e.message}`);
+            resolve({ ok: false, reason: 'invalid_relay_url' });
+            return;
+        }
+
+        const body = JSON.stringify({ webhookUrl, payload: JSON.parse(payload) });
+        const reqOptions = {
+            hostname: urlObj.hostname,
+            path: urlObj.pathname + urlObj.search,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body),
+                'x-relay-secret': process.env.DISCORD_RELAY_SECRET || ''
+            },
+            timeout: 10000
+        };
+
+        const client = urlObj.protocol === 'https:' ? https : http;
+        const req = client.request(reqOptions, (relayRes) => {
+            let resBody = '';
+            relayRes.on('data', (chunk) => { resBody += chunk; });
+            relayRes.on('end', () => {
+                if (relayRes.statusCode >= 200 && relayRes.statusCode < 300) {
+                    console.log(`[Discord] Relayed "${title}" via ${urlObj.hostname} (status ${relayRes.statusCode}).`);
+                    resolve({ ok: true, status: relayRes.statusCode, via: 'relay' });
+                } else {
+                    console.error(`[Discord] Relay rejected "${title}": status ${relayRes.statusCode} body=${resBody.slice(0, 300)}`);
+                    resolve({ ok: false, reason: 'relay_rejected', status: relayRes.statusCode, body: resBody.slice(0, 300) });
+                }
+            });
+        });
+
+        req.on('timeout', () => {
+            console.error(`[Discord] Relay timed out sending "${title}".`);
+            req.destroy();
+            resolve({ ok: false, reason: 'relay_timeout' });
+        });
+
+        req.on('error', (err) => {
+            console.error(`[Discord] Relay request error sending "${title}":`, err.message);
+            resolve({ ok: false, reason: 'relay_request_error', message: err.message });
+        });
+
+        req.write(body);
+        req.end();
+    });
+}
+
 async function sendDiscordNotification(title, description, fields = []) {
     try {
         const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
@@ -320,6 +383,11 @@ async function sendDiscordNotification(title, description, fields = []) {
                 timestamp: new Date().toISOString()
             }]
         });
+
+        const relayUrl = process.env.DISCORD_RELAY_URL;
+        if (relayUrl && relayUrl.trim() !== '') {
+            return await sendViaRelay(relayUrl.trim(), webhookUrl, payload, title);
+        }
 
         const urlObj = new URL(webhookUrl);
         const reqOptions = {
