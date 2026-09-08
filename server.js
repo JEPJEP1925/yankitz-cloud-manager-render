@@ -299,33 +299,29 @@ async function verifyAnyPassword(providedPwd) {
     return isAdmin;
 }
 
-// --- AUTOMATIC DISCORD WEBHOOK SENDER (RENDER FAILSAFE & PRIORITIZED) ---
+// --- AUTOMATIC DISCORD WEBHOOK SENDER (SYNCHRONOUS ENV FIRST ORDER OF OPERATIONS) ---
 async function sendDiscordNotification(title, description, fields = []) {
     try {
-        let webhookUrl = '';
+        // 1. READ RENDER ENVIRONMENT VARIABLE FIRST (SYNCHRONOUS)
+        let webhookUrl = (process.env.DISCORD_WEBHOOK || '').trim();
 
-        // 1. First check Turso Database
-        try {
-            const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
-            if (res.rows && res.rows.length > 0 && res.rows[0].value) {
-                webhookUrl = res.rows[0].value.trim();
+        // 2. ONLY QUERY TURSO DB IF RENDER ENV IS NOT SET
+        if (!webhookUrl) {
+            try {
+                const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
+                if (res.rows && res.rows.length > 0 && res.rows[0].value && res.rows[0].value.trim() !== '') {
+                    webhookUrl = res.rows[0].value.trim();
+                }
+            } catch (dbErr) {
+                console.error("DB Webhook Lookup Error:", dbErr.message);
             }
-        } catch (dbErr) {
-            console.error("Database lookup error for webhook:", dbErr.message);
         }
 
-        // 2. Fallback to Render Environment Variable if DB returned empty or blank
-        if (!webhookUrl || webhookUrl === '') {
-            webhookUrl = (process.env.DISCORD_WEBHOOK || '').trim();
-        }
-
-        // 3. Validation Safety Check
+        // 3. IF STILL BLANK, SKIP EXECUTION WITH WARNING LOG
         if (!webhookUrl || (!webhookUrl.startsWith('http://') && !webhookUrl.startsWith('https://'))) {
-            console.warn("⚠️ Discord Webhook skipped: No valid Webhook URL configured in ENV or Turso DB.");
+            console.warn("⚠️ Discord Webhook skipped: No valid Webhook URL found in Render ENV or Turso DB.");
             return;
         }
-
-        console.log(`📡 Delivering Discord notification to webhook target...`);
 
         const payload = JSON.stringify({
             embeds: [{
