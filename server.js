@@ -299,20 +299,33 @@ async function verifyAnyPassword(providedPwd) {
     return isAdmin;
 }
 
-// --- AUTOMATIC DISCORD WEBHOOK SENDER WITH RATE LIMIT HANDLING & RETRIES ---
+// --- AUTOMATIC DISCORD WEBHOOK SENDER (RENDER FAILSAFE & PRIORITIZED) ---
 async function sendDiscordNotification(title, description, fields = []) {
     try {
-        const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
-        const row = res.rows[0];
-        
-        let webhookUrl = (row && row.value && row.value.trim() !== '') 
-            ? row.value.trim() 
-            : (process.env.DISCORD_WEBHOOK || '');
+        let webhookUrl = '';
 
+        // 1. First check Turso Database
+        try {
+            const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
+            if (res.rows && res.rows.length > 0 && res.rows[0].value) {
+                webhookUrl = res.rows[0].value.trim();
+            }
+        } catch (dbErr) {
+            console.error("Database lookup error for webhook:", dbErr.message);
+        }
+
+        // 2. Fallback to Render Environment Variable if DB returned empty or blank
+        if (!webhookUrl || webhookUrl === '') {
+            webhookUrl = (process.env.DISCORD_WEBHOOK || '').trim();
+        }
+
+        // 3. Validation Safety Check
         if (!webhookUrl || (!webhookUrl.startsWith('http://') && !webhookUrl.startsWith('https://'))) {
-            console.warn("Discord Webhook notification skipped: No valid Webhook URL configured.");
+            console.warn("⚠️ Discord Webhook skipped: No valid Webhook URL configured in ENV or Turso DB.");
             return;
         }
+
+        console.log(`📡 Delivering Discord notification to webhook target...`);
 
         const payload = JSON.stringify({
             embeds: [{
@@ -326,10 +339,7 @@ async function sendDiscordNotification(title, description, fields = []) {
         });
 
         const executeRequest = (urlStr, retryCount = 0) => {
-            if (retryCount > 3) {
-                console.error("Discord notification failed: Maximum retries reached.");
-                return;
-            }
+            if (retryCount > 3) return;
 
             const urlObj = new URL(urlStr);
             const reqOptions = {
@@ -346,27 +356,24 @@ async function sendDiscordNotification(title, description, fields = []) {
             const req = client.request(reqOptions, (discordRes) => {
                 let responseData = '';
                 discordRes.on('data', chunk => { responseData += chunk; });
-
                 discordRes.on('end', () => {
                     if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
-                        console.log("Discord notification delivered successfully.");
+                        console.log("✅ Discord notification delivered successfully!");
                     } else if (discordRes.statusCode === 429) {
                         let retryAfter = 5000;
                         try {
                             const parsed = JSON.parse(responseData);
                             if (parsed.retry_after) retryAfter = Math.ceil(parsed.retry_after * 1000);
                         } catch (e) {}
-
-                        console.warn(`Discord rate limit hit (429). Retrying in ${retryAfter}ms...`);
                         setTimeout(() => executeRequest(urlStr, retryCount + 1), retryAfter);
                     } else {
-                        console.error(`Discord Webhook failed with status ${discordRes.statusCode}: ${responseData}`);
+                        console.error(`❌ Discord Webhook status ${discordRes.statusCode}: ${responseData}`);
                     }
                 });
             });
 
             req.on('error', (err) => {
-                console.error("Discord Webhook network error:", err.message);
+                console.error("❌ Discord Webhook network error:", err.message);
             });
 
             req.write(payload);
