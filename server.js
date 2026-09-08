@@ -299,6 +299,7 @@ async function verifyAnyPassword(providedPwd) {
     return isAdmin;
 }
 
+// --- AUTOMATIC DISCORD WEBHOOK SENDER WITH RATE LIMIT HANDLING & RETRIES ---
 async function sendDiscordNotification(title, description, fields = []) {
     try {
         const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
@@ -315,38 +316,65 @@ async function sendDiscordNotification(title, description, fields = []) {
 
         const payload = JSON.stringify({
             embeds: [{
-                title, description, color: 3447003, fields,
+                title, 
+                description, 
+                color: 3447003, 
+                fields,
                 footer: { text: "Yankitz Cloud Manager" },
                 timestamp: new Date().toISOString()
             }]
         });
 
-        const urlObj = new URL(webhookUrl);
-        const reqOptions = {
-            hostname: urlObj.hostname,
-            path: urlObj.pathname + urlObj.search,
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(payload)
+        const executeRequest = (urlStr, retryCount = 0) => {
+            if (retryCount > 3) {
+                console.error("Discord notification failed: Maximum retries reached.");
+                return;
             }
+
+            const urlObj = new URL(urlStr);
+            const reqOptions = {
+                hostname: urlObj.hostname,
+                path: urlObj.pathname + urlObj.search,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(payload)
+                }
+            };
+
+            const client = urlObj.protocol === 'https:' ? https : http;
+            const req = client.request(reqOptions, (discordRes) => {
+                let responseData = '';
+                discordRes.on('data', chunk => { responseData += chunk; });
+
+                discordRes.on('end', () => {
+                    if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
+                        console.log("Discord notification delivered successfully.");
+                    } else if (discordRes.statusCode === 429) {
+                        let retryAfter = 5000;
+                        try {
+                            const parsed = JSON.parse(responseData);
+                            if (parsed.retry_after) retryAfter = Math.ceil(parsed.retry_after * 1000);
+                        } catch (e) {}
+
+                        console.warn(`Discord rate limit hit (429). Retrying in ${retryAfter}ms...`);
+                        setTimeout(() => executeRequest(urlStr, retryCount + 1), retryAfter);
+                    } else {
+                        console.error(`Discord Webhook failed with status ${discordRes.statusCode}: ${responseData}`);
+                    }
+                });
+            });
+
+            req.on('error', (err) => {
+                console.error("Discord Webhook network error:", err.message);
+            });
+
+            req.write(payload);
+            req.end();
         };
 
-        const client = urlObj.protocol === 'https:' ? https : http;
-        const req = client.request(reqOptions, (discordRes) => {
-            if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
-                console.log("Discord notification delivered successfully.");
-            } else {
-                console.error(`Discord Webhook failed with status code: ${discordRes.statusCode}`);
-            }
-        });
+        executeRequest(webhookUrl);
 
-        req.on('error', (err) => {
-            console.error("Discord Webhook network error:", err.message);
-        });
-
-        req.write(payload);
-        req.end();
     } catch (e) {
         console.error("Error executing sendDiscordNotification:", e.message);
     }
@@ -674,7 +702,7 @@ const viewPageTemplate = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// --- AUTOMATIC MODAL OPEN REQUEST PORTAL HTML ---
+// AUTOMATIC MODAL OPEN REQUEST PORTAL HTML
 function getRequestPortalHtml() {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -715,7 +743,6 @@ function getRequestPortalHtml() {
         
         .status { margin-top: 14px; font-size: 0.875rem; font-weight: 500; }
 
-        /* DIRECT MODAL OVERLAY */
         .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.65); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: 16px; }
         .modal-container { background: #ffffff; border-radius: 14px; width: 100%; max-width: 440px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.2); overflow: hidden; animation: modalPop 0.2s ease-out; }
         @keyframes modalPop { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
@@ -775,7 +802,6 @@ function getRequestPortalHtml() {
     </div>
 
     <script>
-        // OVERRIDE BROWSER POPUPS WITH EXACT MATCH CUSTOM UI MODAL (RESIZED TO MATCH SHARES MODAL)
         function showCustomAlert(message, title) {
             var existingModal = document.getElementById('customAlertModal');
             if (existingModal) existingModal.remove();
@@ -863,7 +889,6 @@ function getRequestPortalHtml() {
             });
         }
 
-        // Intercept native browser popups
         window.alert = function(msg) {
             if (msg && msg.indexOf('Pre-reserved') !== -1) {
                 showCustomAlert('', 'PRE-RESERVED LINK CREATED');
@@ -1162,7 +1187,6 @@ function getRequestPortalHtml() {
 </html>`;
 }
 
-// Only Google's resumable upload endpoint may be proxied to, to prevent SSRF via x-upload-url.
 const ALLOWED_UPLOAD_HOSTNAMES = new Set([
     'www.googleapis.com',
     'googleapis.com',
@@ -1286,6 +1310,7 @@ app.post('/api/forward-incoming/:id', async (req, res) => {
 
         await logActivity('FORWARDED_INCOMING_FILE', { incomingId, slug: customSlug, fileName: row.original_name, ip: clientIp });
 
+        // AUTOMATIC DISCORD NOTIFICATION
         sendDiscordNotification("Incoming File Forwarded as Shared Link", `An incoming file was forwarded and protected.`, [
             { name: "File Name", value: row.original_name, inline: true },
             { name: "Share Slug", value: customSlug, inline: true },
@@ -1346,6 +1371,7 @@ app.post('/api/pre-reserve-link', async (req, res) => {
 
         await logActivity('PRE_RESERVED_LINK', { slug: customSlug, fileName, ip: clientIp });
 
+        // AUTOMATIC DISCORD NOTIFICATION
         sendDiscordNotification("Pre-Reserved Link Created", `A link was pre-reserved for manual Google Drive upload.`, [
             { name: "File Name", value: fileName, inline: true },
             { name: "Share ID / Slug", value: customSlug, inline: true },
@@ -1426,6 +1452,7 @@ app.post('/api/finalize-drive-upload', async (req, res) => {
 
         await logActivity('FILE_UPLOAD', { slug: customSlug, fileName, size: totalSize, ip: clientIp });
 
+        // AUTOMATIC DISCORD NOTIFICATION
         sendDiscordNotification("New Shared File Created", `A file was shared via Yankitz Cloud Manager.`, [
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(totalSize), inline: true },
@@ -1497,6 +1524,7 @@ app.post('/api/finalize-incoming-upload/:slug', async (req, res) => {
 
         await logActivity('INCOMING_FILE_UPLOAD', { requestTitle: requestRow.title, fileName, size: totalSize, ip: clientIp });
 
+        // AUTOMATIC DISCORD NOTIFICATION
         sendDiscordNotification("Incoming Requested File Uploaded", `A user uploaded a file for a request.`, [
             { name: "Request Title", value: requestRow.title, inline: true },
             { name: "File Name", value: fileName, inline: true },
@@ -1527,6 +1555,7 @@ app.post('/api/pre-reserve-incoming-link/:slug', async (req, res) => {
 
         await logActivity('PRE_RESERVED_INCOMING', { requestTitle: requestRow.title, fileName, ip: clientIp });
 
+        // AUTOMATIC DISCORD NOTIFICATION
         sendDiscordNotification("Pre-Reserved Incoming File Created", `A user pre-reserved a file entry for a request portal.`, [
             { name: "Request Title", value: requestRow.title, inline: true },
             { name: "File Name", value: fileName, inline: true },
@@ -1811,7 +1840,7 @@ app.get('/api/stream/:slug', async (req, res) => {
     }
 });
 
-// Shared helper function for downloading files by slug
+// Helper function for downloads
 async function handleSharedFileDownload(req, res, slug, password) {
     try {
         const fileRes = await db.execute({ sql: `SELECT * FROM shared_files WHERE slug = ?`, args: [slug] });
@@ -1855,14 +1884,12 @@ async function handleSharedFileDownload(req, res, slug, password) {
     }
 }
 
-// Support GET requests (direct browser navigation/clicks)
 app.get('/api/download/:slug', async (req, res) => {
     const { slug } = req.params;
     const password = (req.query.password || '').trim();
     await handleSharedFileDownload(req, res, slug, password);
 });
 
-// Support POST requests (API calls with JSON body)
 app.post('/api/download/:slug', async (req, res) => {
     const { slug } = req.params;
     const { password } = (req.body || {});
@@ -1915,6 +1942,7 @@ app.post('/api/requests', async (req, res) => {
 
     await logActivity('REQUEST_CREATED', { slug, title, email, ip: clientIp });
 
+    // AUTOMATIC DISCORD NOTIFICATION
     sendDiscordNotification("New Upload Request Link Generated", `A file upload request link has been created.`, [
         { name: "Request Title", value: title, inline: true },
         { name: "Share ID / Slug", value: slug, inline: true },
@@ -2084,7 +2112,6 @@ app.get('/api/stream-incoming/:id', async (req, res) => {
     }
 });
 
-// Helper function to process incoming downloads
 async function handleIncomingFileDownload(req, res, id, userPwd) {
     const isValidUser = await verifyAnyPassword(userPwd);
     if (!isValidUser) return res.status(401).json({ error: 'Invalid Password' });
