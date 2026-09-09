@@ -12,8 +12,8 @@ const { createClient } = require('@libsql/client');
 const app = express();
 const PORT = process.env.PORT || 3017;
 
-// Target Google Drive Folder ID
-const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || process.env.GOOGLE_DRIVE_FOLDER_ID || '1XihGWQM1jjQenAFxJdhB7kkdPjNmDycz';
+// Target Google Drive Folder ID (Isolated Yankitz Cloud Manager Folder)
+const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || process.env.GOOGLE_DRIVE_FOLDER_ID || '1XihgWQM1jjQenAFxJdhB7kkdPjNmDycz';
 
 // Silence Favicon 404 logs
 app.get(['/favicon.ico', '/favicon.png'], (req, res) => res.status(204).end());
@@ -138,6 +138,62 @@ async function syncRecordWithDrive(table, record) {
     }
 }
 
+// --- CROSS-HOST SYNC LOCK (Railway + Render + Vercel share one Turso DB) ---
+// Acquire: atomically claim the single sync_lock row if it is free or its lease expired.
+// Release: clear it so the next scheduled/cron cycle (on any host) can acquire it.
+async function acquireSyncLock(leaseMs) {
+    const now = Date.now();
+    const until = now + leaseMs;
+    try {
+        const res = await db.execute({
+            sql: `UPDATE sync_lock SET locked_until = ? WHERE id = 1 AND (locked_until IS NULL OR locked_until < ?)`,
+            args: [until, now]
+        });
+        return !!(res && res.rowsAffected && res.rowsAffected > 0);
+    } catch (e) {
+        console.error('acquireSyncLock error:', e.message);
+        return false;
+    }
+}
+
+async function releaseSyncLock() {
+    try {
+        await db.execute({ sql: `UPDATE sync_lock SET locked_until = NULL WHERE id = 1`, args: [] });
+    } catch (e) {
+        console.error('releaseSyncLock error:', e.message);
+    }
+}
+
+// --- BACKGROUND TWO-WAY GOOGLE DRIVE SYNC (shared implementation) ---
+// This is the single implementation of the sync cycle. It is scheduled differently
+// per platform (see the scheduler near the bottom of this file) but the logic itself
+// is never duplicated.
+async function runDriveSyncCycle() {
+    if (!driveService) return { skipped: true, reason: 'drive_not_configured' };
+
+    const leaseMs = 40000; // slightly under the 45s cadence so a crashed instance can't hold the lock forever
+    const gotLock = await acquireSyncLock(leaseMs);
+    if (!gotLock) return { skipped: true, reason: 'lock_held_by_another_host' };
+
+    try {
+        const sharedRes = await db.execute(`SELECT * FROM shared_files WHERE drive_file_id IS NOT NULL AND drive_file_id != 'PENDING_DIRECT_DRIVE_UPLOAD'`);
+        for (let file of sharedRes.rows || []) {
+            await syncRecordWithDrive('shared_files', file);
+        }
+
+        const incomingRes = await db.execute(`SELECT * FROM incoming_files WHERE drive_file_id IS NOT NULL AND drive_file_id != 'PENDING_DIRECT_DRIVE_UPLOAD'`);
+        for (let file of incomingRes.rows || []) {
+            await syncRecordWithDrive('incoming_files', file);
+        }
+        return { skipped: false };
+    } catch (e) {
+        console.error('Background Drive sync error:', e.message);
+        return { skipped: false, error: e.message };
+    } finally {
+        await releaseSyncLock();
+    }
+}
+
 // --- 2. TURSO / LIBSQL DATABASE SETUP ---
 let tursoUrl = process.env.TURSO_DATABASE_URL || "file:share.db";
 const tursoAuthToken = process.env.TURSO_AUTH_TOKEN || "";
@@ -217,6 +273,19 @@ async function initDatabase() {
                 value TEXT
             )
         `);
+
+        // Cross-host lock for the Google Drive background sync cycle. Railway, Render,
+        // and Vercel all share this Turso database, so this single row (via an atomic
+        // UPDATE ... WHERE) is used to ensure only one deployment runs a sync cycle at
+        // a time, instead of relying on an in-process variable that only one host could see.
+        await db.execute(`
+            CREATE TABLE IF NOT EXISTS sync_lock (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                locked_until INTEGER
+            )
+        `);
+        await db.execute(`INSERT OR IGNORE INTO sync_lock (id, locked_until) VALUES (1, NULL)`);
+
         console.log("Turso Cloud Database connected and initialized.");
     } catch (e) {
         console.error("Database initialization error:", e.message);
@@ -299,90 +368,100 @@ async function verifyAnyPassword(providedPwd) {
     return isAdmin;
 }
 
-// --- AUTOMATIC DISCORD WEBHOOK SENDER (WITH EMBEDDED ERROR 1015 BYPASS) ---
+// --- DISCORD NOTIFICATION DELIVERY ---
+// IMPORTANT: this function is `async` and now genuinely waits for the Discord HTTP
+// request to finish (success, non-2xx, or network error) before its returned Promise
+// resolves. The previous version created the http/https request and returned
+// immediately after `req.end()`, without ever waiting on the 'response' or 'error'
+// event — so `await sendDiscordNotification(...)` (had it been used) would not have
+// actually waited for delivery, and the notification's fate depended entirely on
+// whether the process/request happened to stay alive long enough for the background
+// callback to fire on its own. That is fragile on any platform, and fatal on a
+// serverless one: Vercel can freeze or tear down a function's execution context as
+// soon as the HTTP response is sent back to the browser, which can cut off in-flight
+// work that was never explicitly awaited. All call sites below have been updated to
+// `await` this function so the request handler does not finish (and the platform does
+// not treat the work as done) until the Discord delivery attempt has actually resolved.
 async function sendDiscordNotification(title, description, fields = []) {
+    let webhookUrl;
     try {
-        let webhookUrl = (process.env.DISCORD_WEBHOOK || '').trim();
+        const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
+        const row = res.rows[0];
 
-        if (!webhookUrl) {
-            try {
-                const res = await db.execute({ sql: `SELECT value FROM settings WHERE key = 'discord_webhook'`, args: [] });
-                if (res.rows && res.rows.length > 0 && res.rows[0].value && res.rows[0].value.trim() !== '') {
-                    webhookUrl = res.rows[0].value.trim();
-                }
-            } catch (dbErr) {
-                console.error("DB Webhook Lookup Error:", dbErr.message);
-            }
-        }
+        webhookUrl = (row && row.value && row.value.trim() !== '')
+            ? row.value.trim()
+            : (process.env.DISCORD_WEBHOOK || '');
 
         if (!webhookUrl || (!webhookUrl.startsWith('http://') && !webhookUrl.startsWith('https://'))) {
-            console.warn("⚠️ Discord Webhook skipped: No valid Webhook URL found.");
-            return;
+            // Never log the value of DISCORD_WEBHOOK / the settings row itself, only whether it was found.
+            console.warn(`[discord] notification "${title}" skipped: no valid webhook URL configured (checked settings table and DISCORD_WEBHOOK env var).`);
+            return { delivered: false, reason: 'no_webhook_configured' };
         }
+    } catch (e) {
+        console.error(`[discord] notification "${title}" skipped: error reading webhook config from DB:`, e.message);
+        return { delivered: false, reason: 'webhook_lookup_error', error: e.message };
+    }
 
-        // Bypasses Discord Cloudflare Error 1015 IP Rate Limits on Render automatically
-        if (webhookUrl.includes('discord.com/api/webhooks')) {
-            webhookUrl = webhookUrl.replace('discord.com/api/webhooks', 'discordp.com/api/webhooks');
-        }
+    const payload = JSON.stringify({
+        embeds: [{
+            title, description, color: 3447003, fields,
+            footer: { text: "Yankitz Cloud Manager" },
+            timestamp: new Date().toISOString()
+        }]
+    });
 
-        const payload = JSON.stringify({
-            embeds: [{
-                title, 
-                description, 
-                color: 3447003, 
-                fields,
-                footer: { text: "Yankitz Cloud Manager" },
-                timestamp: new Date().toISOString()
-            }]
+    let urlObj;
+    try {
+        urlObj = new URL(webhookUrl);
+    } catch (e) {
+        console.error(`[discord] notification "${title}" skipped: configured webhook URL is not a valid URL.`);
+        return { delivered: false, reason: 'invalid_webhook_url' };
+    }
+
+    const reqOptions = {
+        hostname: urlObj.hostname,
+        port: urlObj.port || undefined, // pre-existing code omitted this; harmless for real Discord webhooks
+                                         // (always default-port https), but fixed since we're already here.
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload)
+        },
+        timeout: 10000
+    };
+
+    console.log(`[discord] notification "${title}" -> webhook request starting.`);
+
+    return new Promise((resolve) => {
+        const client = urlObj.protocol === 'https:' ? https : http;
+        const req = client.request(reqOptions, (discordRes) => {
+            // Drain the response body so the socket can close cleanly; we don't need the content.
+            discordRes.on('data', () => {});
+            discordRes.on('end', () => {
+                if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
+                    console.log(`[discord] notification "${title}" -> delivered (status ${discordRes.statusCode}).`);
+                    resolve({ delivered: true, status: discordRes.statusCode });
+                } else {
+                    console.error(`[discord] notification "${title}" -> Discord responded with status ${discordRes.statusCode}.`);
+                    resolve({ delivered: false, reason: 'non_2xx_response', status: discordRes.statusCode });
+                }
+            });
         });
 
-        const executeRequest = (urlStr, retryCount = 0) => {
-            if (retryCount > 3) return;
+        req.on('timeout', () => {
+            console.error(`[discord] notification "${title}" -> request timed out after ${reqOptions.timeout}ms.`);
+            req.destroy();
+        });
 
-            const urlObj = new URL(urlStr);
-            const reqOptions = {
-                hostname: urlObj.hostname,
-                path: urlObj.pathname + urlObj.search,
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Content-Length': Buffer.byteLength(payload)
-                }
-            };
+        req.on('error', (err) => {
+            console.error(`[discord] notification "${title}" -> network error:`, err.message);
+            resolve({ delivered: false, reason: 'network_error', error: err.message });
+        });
 
-            const client = urlObj.protocol === 'https:' ? https : http;
-            const req = client.request(reqOptions, (discordRes) => {
-                let responseData = '';
-                discordRes.on('data', chunk => { responseData += chunk; });
-                discordRes.on('end', () => {
-                    if (discordRes.statusCode >= 200 && discordRes.statusCode < 300) {
-                        console.log("✅ Discord notification delivered successfully!");
-                    } else if (discordRes.statusCode === 429) {
-                        let retryAfter = 5000;
-                        try {
-                            const parsed = JSON.parse(responseData);
-                            if (parsed.retry_after) retryAfter = Math.ceil(parsed.retry_after * 1000);
-                        } catch (e) {}
-                        setTimeout(() => executeRequest(urlStr, retryCount + 1), retryAfter);
-                    } else {
-                        console.error(`❌ Discord Webhook status ${discordRes.statusCode}: ${responseData}`);
-                    }
-                });
-            });
-
-            req.on('error', (err) => {
-                console.error("❌ Discord Webhook network error:", err.message);
-            });
-
-            req.write(payload);
-            req.end();
-        };
-
-        executeRequest(webhookUrl);
-
-    } catch (e) {
-        console.error("Error executing sendDiscordNotification:", e.message);
-    }
+        req.write(payload);
+        req.end();
+    });
 }
 
 function parseRangeHeader(rangeHeader, fileSize) {
@@ -707,6 +786,7 @@ const viewPageTemplate = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// --- AUTOMATIC MODAL OPEN REQUEST PORTAL HTML ---
 function getRequestPortalHtml() {
     return `<!DOCTYPE html>
 <html lang="en">
@@ -747,6 +827,7 @@ function getRequestPortalHtml() {
         
         .status { margin-top: 14px; font-size: 0.875rem; font-weight: 500; }
 
+        /* DIRECT MODAL OVERLAY */
         .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(15, 23, 42, 0.65); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: 16px; }
         .modal-container { background: #ffffff; border-radius: 14px; width: 100%; max-width: 440px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.2); overflow: hidden; animation: modalPop 0.2s ease-out; }
         @keyframes modalPop { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
@@ -806,6 +887,7 @@ function getRequestPortalHtml() {
     </div>
 
     <script>
+        // OVERRIDE BROWSER POPUPS WITH EXACT MATCH CUSTOM UI MODAL (RESIZED TO MATCH SHARES MODAL)
         function showCustomAlert(message, title) {
             var existingModal = document.getElementById('customAlertModal');
             if (existingModal) existingModal.remove();
@@ -893,6 +975,7 @@ function getRequestPortalHtml() {
             });
         }
 
+        // Intercept native browser popups
         window.alert = function(msg) {
             if (msg && msg.indexOf('Pre-reserved') !== -1) {
                 showCustomAlert('', 'PRE-RESERVED LINK CREATED');
@@ -1191,6 +1274,7 @@ function getRequestPortalHtml() {
 </html>`;
 }
 
+// Only Google's resumable upload endpoint may be proxied to, to prevent SSRF via x-upload-url.
 const ALLOWED_UPLOAD_HOSTNAMES = new Set([
     'www.googleapis.com',
     'googleapis.com',
@@ -1314,8 +1398,7 @@ app.post('/api/forward-incoming/:id', async (req, res) => {
 
         await logActivity('FORWARDED_INCOMING_FILE', { incomingId, slug: customSlug, fileName: row.original_name, ip: clientIp });
 
-        // AUTOMATIC DISCORD NOTIFICATION
-        sendDiscordNotification("Incoming File Forwarded as Shared Link", `An incoming file was forwarded and protected.`, [
+        await sendDiscordNotification("Incoming File Forwarded as Shared Link", `An incoming file was forwarded and protected.`, [
             { name: "File Name", value: row.original_name, inline: true },
             { name: "Share Slug", value: customSlug, inline: true },
             { name: "Protected", value: password ? "Yes 🔒" : "No 🔓", inline: true },
@@ -1375,8 +1458,7 @@ app.post('/api/pre-reserve-link', async (req, res) => {
 
         await logActivity('PRE_RESERVED_LINK', { slug: customSlug, fileName, ip: clientIp });
 
-        // AUTOMATIC DISCORD NOTIFICATION
-        sendDiscordNotification("Pre-Reserved Link Created", `A link was pre-reserved for manual Google Drive upload.`, [
+        await sendDiscordNotification("Pre-Reserved Link Created", `A link was pre-reserved for manual Google Drive upload.`, [
             { name: "File Name", value: fileName, inline: true },
             { name: "Share ID / Slug", value: customSlug, inline: true },
             { name: "URL", value: shareUrl, inline: false }
@@ -1456,8 +1538,7 @@ app.post('/api/finalize-drive-upload', async (req, res) => {
 
         await logActivity('FILE_UPLOAD', { slug: customSlug, fileName, size: totalSize, ip: clientIp });
 
-        // AUTOMATIC DISCORD NOTIFICATION
-        sendDiscordNotification("New Shared File Created", `A file was shared via Yankitz Cloud Manager.`, [
+        await sendDiscordNotification("New Shared File Created", `A file was shared via Yankitz Cloud Manager.`, [
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(totalSize), inline: true },
             { name: "Share ID / Slug", value: customSlug, inline: true },
@@ -1528,8 +1609,7 @@ app.post('/api/finalize-incoming-upload/:slug', async (req, res) => {
 
         await logActivity('INCOMING_FILE_UPLOAD', { requestTitle: requestRow.title, fileName, size: totalSize, ip: clientIp });
 
-        // AUTOMATIC DISCORD NOTIFICATION
-        sendDiscordNotification("Incoming Requested File Uploaded", `A user uploaded a file for a request.`, [
+        await sendDiscordNotification("Incoming Requested File Uploaded", `A user uploaded a file for a request.`, [
             { name: "Request Title", value: requestRow.title, inline: true },
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(totalSize), inline: true }
@@ -1559,8 +1639,7 @@ app.post('/api/pre-reserve-incoming-link/:slug', async (req, res) => {
 
         await logActivity('PRE_RESERVED_INCOMING', { requestTitle: requestRow.title, fileName, ip: clientIp });
 
-        // AUTOMATIC DISCORD NOTIFICATION
-        sendDiscordNotification("Pre-Reserved Incoming File Created", `A user pre-reserved a file entry for a request portal.`, [
+        await sendDiscordNotification("Pre-Reserved Incoming File Created", `A user pre-reserved a file entry for a request portal.`, [
             { name: "Request Title", value: requestRow.title, inline: true },
             { name: "File Name", value: fileName, inline: true },
             { name: "File Size", value: formatBytes(fileSize), inline: true }
@@ -1844,7 +1923,7 @@ app.get('/api/stream/:slug', async (req, res) => {
     }
 });
 
-// Helper function for downloads
+// Shared helper function for downloading files by slug
 async function handleSharedFileDownload(req, res, slug, password) {
     try {
         const fileRes = await db.execute({ sql: `SELECT * FROM shared_files WHERE slug = ?`, args: [slug] });
@@ -1888,12 +1967,14 @@ async function handleSharedFileDownload(req, res, slug, password) {
     }
 }
 
+// Support GET requests (direct browser navigation/clicks)
 app.get('/api/download/:slug', async (req, res) => {
     const { slug } = req.params;
     const password = (req.query.password || '').trim();
     await handleSharedFileDownload(req, res, slug, password);
 });
 
+// Support POST requests (API calls with JSON body)
 app.post('/api/download/:slug', async (req, res) => {
     const { slug } = req.params;
     const { password } = (req.body || {});
@@ -1946,8 +2027,7 @@ app.post('/api/requests', async (req, res) => {
 
     await logActivity('REQUEST_CREATED', { slug, title, email, ip: clientIp });
 
-    // AUTOMATIC DISCORD NOTIFICATION
-    sendDiscordNotification("New Upload Request Link Generated", `A file upload request link has been created.`, [
+    await sendDiscordNotification("New Upload Request Link Generated", `A file upload request link has been created.`, [
         { name: "Request Title", value: title, inline: true },
         { name: "Share ID / Slug", value: slug, inline: true },
         { name: "Recipient Email", value: email || "N/A", inline: true },
@@ -2116,6 +2196,7 @@ app.get('/api/stream-incoming/:id', async (req, res) => {
     }
 });
 
+// Helper function to process incoming downloads
 async function handleIncomingFileDownload(req, res, id, userPwd) {
     const isValidUser = await verifyAnyPassword(userPwd);
     if (!isValidUser) return res.status(401).json({ error: 'Invalid Password' });
@@ -2342,26 +2423,40 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// --- BACKGROUND TWO-WAY GOOGLE DRIVE SYNC WORKER ---
-setInterval(async () => {
-    if (!driveService) return;
-    try {
-        const sharedRes = await db.execute(`SELECT * FROM shared_files WHERE drive_file_id IS NOT NULL AND drive_file_id != 'PENDING_DIRECT_DRIVE_UPLOAD'`);
-        for (let file of sharedRes.rows || []) {
-            await syncRecordWithDrive('shared_files', file);
-        }
+// --- GOOGLE DRIVE SYNC SCHEDULER (platform-specific trigger, shared implementation) ---
+// Railway and Render are long-running processes, so they drive runDriveSyncCycle() with
+// a local interval, same as before. Vercel functions are invoked per-request and cannot
+// host a persistent setInterval, so on Vercel this endpoint is hit on a schedule by
+// Vercel Cron instead (see vercel.json). Either way it calls the exact same sync
+// implementation above, and acquireSyncLock()/releaseSyncLock() (backed by the shared
+// Turso DB) stop Railway, Render, and Vercel from running a sync cycle at the same time.
+//
+// process.env.VERCEL is set automatically by the Vercel platform itself (not something
+// we invented here), so this is a hosting-neutral way to pick the right scheduler.
+if (!process.env.VERCEL) {
+    setInterval(() => { runDriveSyncCycle(); }, 45000);
+}
 
-        const incomingRes = await db.execute(`SELECT * FROM incoming_files WHERE drive_file_id IS NOT NULL AND drive_file_id != 'PENDING_DIRECT_DRIVE_UPLOAD'`);
-        for (let file of incomingRes.rows || []) {
-            await syncRecordWithDrive('incoming_files', file);
-        }
-    } catch (e) {
-        console.error('Background Drive sync error:', e.message);
+app.all('/api/cron/sync-drive', async (req, res) => {
+    const providedSecret = req.headers['x-cron-secret'] || req.query.secret ||
+        String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
+    if (process.env.CRON_SECRET && providedSecret !== process.env.CRON_SECRET) {
+        return res.status(401).json({ error: 'Unauthorized' });
     }
-}, 45000);
+    const result = await runDriveSyncCycle();
+    res.json({ success: true, ...result });
+});
 
-// --- START SERVER ---
-const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-server.timeout = 7200000;
-server.keepAliveTimeout = 7200000;
-server.headersTimeout = 7205000;
+// --- START SERVER (Railway / Render) ---
+// Vercel does not call app.listen() itself; it imports the exported `app` (via
+// api/index.js) and manages the HTTP server on its own. require.main === module is
+// true only when this file is run directly (`node server.js`, i.e. `npm start` on
+// Railway/Render), so this block is skipped when the file is merely `require`d.
+if (require.main === module) {
+    const server = app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+    server.timeout = 7200000;
+    server.keepAliveTimeout = 7200000;
+    server.headersTimeout = 7205000;
+}
+
+module.exports = app;
