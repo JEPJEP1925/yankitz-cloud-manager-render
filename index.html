@@ -957,7 +957,14 @@
             document.getElementById('shareFileLabel').textContent = 'Select file(s)';
             loadShareFiles();
         } catch (e) {
-            showNotification('PRE-RESERVE LINK FAILED');
+            // Show the server's actual reason (e.g. a wrong password) instead of
+            // always collapsing every failure into a generic "FAILED" message.
+            const msg = (e && e.message ? e.message : '').toLowerCase();
+            if (msg.includes('invalid password')) {
+                await showNotification('INVALID PASSWORD');
+            } else {
+                await showNotification('PRE-RESERVE LINK FAILED');
+            }
         }
     }
 
@@ -979,6 +986,7 @@
         isShareCancelled = false;
         isSharePaused = false;
 
+        let uploadSucceeded = false;
         if (files.length > 1) {
             document.getElementById('shareFileNameDisplay').textContent = 'Creating ZIP archive...';
             const zip = new JSZip();
@@ -989,14 +997,18 @@
             const zipName = `Files_Package_${Math.random().toString(36).substring(2, 8)}.zip`;
             const zipFile = new File([zipBlob], zipName, { type: 'application/zip' });
 
-            await uploadFileDirectResumable(zipFile, uPwd);
+            uploadSucceeded = await uploadFileDirectResumable(zipFile, uPwd);
         } else {
-            await uploadFileDirectResumable(files[0], uPwd);
+            uploadSucceeded = await uploadFileDirectResumable(files[0], uPwd);
         }
 
         document.getElementById('shareTorrentBox').classList.remove('active');
         document.getElementById('btnStartShareUpload').disabled = false;
-        if (!isShareCancelled) {
+        // Only announce success and refresh the Shares list when the upload actually
+        // succeeded. uploadFileDirectResumable() already showed the specific failure
+        // notification (e.g. INVALID PASSWORD) in that case — showing 'UPLOAD COMPLETED'
+        // here too, on top of it, is exactly the false-positive this fixes.
+        if (!isShareCancelled && uploadSucceeded) {
             await showNotification('UPLOAD COMPLETED');
             input.value = '';
             document.getElementById('shareFileLabel').textContent = 'Select file(s)';
@@ -1004,6 +1016,11 @@
         }
     }
 
+    // Returns true if the file was actually uploaded and shared, false if it failed
+    // (password rejected, network error, etc). Callers MUST check this return value
+    // before assuming the upload succeeded — this function shows its own failure
+    // notification (and awaits it) but does not throw, so silently ignoring the
+    // return value would let a caller think every attempt succeeded even when it didn't.
     async function uploadFileDirectResumable(file, userPwd) {
         document.getElementById('shareFileNameDisplay').textContent = formatMobileText(file.name);
         const totalBytes = file.size;
@@ -1022,7 +1039,7 @@
             });
 
             const sessionData = await sessionRes.json();
-            if (!sessionRes.ok) throw new Error(sessionData.error || 'INVALID PASSWORD');
+            if (!sessionRes.ok) throw new Error(sessionData.error || 'Invalid Password');
 
             const resumableUrl = sessionData.resumableUrl;
             activeShareResumableUrl = resumableUrl;
@@ -1031,12 +1048,12 @@
             let startTime = Date.now();
 
             while (startByte < totalBytes) {
-                if (isShareCancelled) return;
+                if (isShareCancelled) return false;
 
                 if (isSharePaused) {
                     while (isSharePaused) {
                         await new Promise(r => setTimeout(r, 500));
-                        if (isShareCancelled) return;
+                        if (isShareCancelled) return false;
                     }
                 }
 
@@ -1047,7 +1064,7 @@
                 let retries = 0;
 
                 while (!chunkUploaded && retries < 3) {
-                    if (isShareCancelled) return;
+                    if (isShareCancelled) return false;
                     try {
                         const chunkUploadRes = await fetch('/api/upload-chunk', {
                             method: 'PUT',
@@ -1102,14 +1119,22 @@
                     }
                 }
             }
+
+            return true;
         } catch (e) {
             if (!isShareCancelled) {
-                if (e.message.includes('INVALID PASSWORD')) {
-                    showNotification('INVALID PASSWORD');
+                // Server sends 'Invalid Password' (see /api/get-drive-resumable-url and
+                // /api/finalize-drive-upload) — compare case-insensitively instead of the
+                // previous exact 'INVALID PASSWORD' match, which never matched anything
+                // and silently fell through to the generic 'UPLOAD FAILED' message.
+                const msg = (e && e.message ? e.message : '').toLowerCase();
+                if (msg.includes('invalid password')) {
+                    await showNotification('INVALID PASSWORD');
                 } else {
-                    showNotification('UPLOAD FAILED');
+                    await showNotification('UPLOAD FAILED');
                 }
             }
+            return false;
         }
     }
 
